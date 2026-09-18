@@ -1,7 +1,11 @@
 FROM php:8.2-apache
 
-# Enable curl extension (needed by sms_proxy.php)
-RUN docker-php-ext-install curl
+# Install curl dev headers + pkg-config first (php-ext-install curl needs
+# these to build the extension), then enable the curl extension itself.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libcurl4-openssl-dev pkg-config && \
+    docker-php-ext-install curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy the proxy script into Apache's web root
 COPY sms_proxy.php /var/www/html/sms_proxy.php
