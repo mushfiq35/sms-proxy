@@ -7,8 +7,11 @@ RUN apt-get update && \
     docker-php-ext-install curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy the proxy script into Apache's web root
-COPY sms_proxy.php /var/www/html/sms_proxy.php
+# Copy everything in this folder (sms_proxy.php, ip_check.php, any future
+# .php files) into Apache's web root, so new files show up automatically
+# without editing the Dockerfile again.
+COPY . /var/www/html/
+RUN rm -f /var/www/html/Dockerfile /var/www/html/start.sh /var/www/html/README.md /var/www/html/.gitattributes
 RUN echo "SMS Proxy is running." > /var/www/html/index.html
 
 # Render assigns a random $PORT at runtime and expects the app to listen on
