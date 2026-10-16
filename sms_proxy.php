@@ -1,78 +1,194 @@
 <?php
 /**
- * SMS Proxy for AGI SMS HTTP API
- * -------------------------------
- * Purpose: Your POS app is hosted over HTTPS (piconetit.com), but AGI's SMS
- * server only accepts HTTP. Browsers block HTTPS pages from calling HTTP
- * endpoints directly (Mixed Content) and AGI's server does not send CORS
- * headers either. This script sits on your own HTTPS server and forwards
- * the request to AGI server-side (PHP is not a browser, so neither
- * restriction applies here).
+ * sms_proxy.php — Bridge between an HTTPS app (POS) and the AGI SMS HTTP server (http://IP:PORT)
  *
- * Upload this file to your piconetit.com hosting (same folder as your app,
- * or anywhere reachable), e.g. as:  https://piconetit.com/sms_proxy.php
- *
- * The app calls THIS file (same-origin HTTPS), and this file calls AGI.
+ * - Accepts GET, POST form-data, x-www-form-urlencoded, or JSON body
+ * - Accepts many parameter name variants (apikey / api_key / apiKey ...)
+ * - Tells you EXACTLY which field is missing instead of AGI's "Missing required parameter"
+ * - Optional: put your keys here so the POS never needs to send them
+ * - Debug: add  ?debug=1  to see what the proxy received (keys hidden), nothing is sent
  */
 
-header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+/* ======================= CONFIG (optional) ======================= */
+// AGI server. Always used (the app's Base URL is ignored for security, so no one can misuse the proxy).
+const AGI_BASE_URL   = 'http://103.48.119.37:2300';
+const AGI_SEND_PATH  = '/sendtext';
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit;
+// Leave '' to take these from the app. Fill them in to keep keys off the browser (recommended).
+const DEFAULT_APIKEY    = '';
+const DEFAULT_SECRETKEY = '';
+const DEFAULT_CALLERID  = '';   // e.g. 8809617640273 or your masking name
+
+// Which websites may call this proxy. '*' = any. Better: 'https://your-pos-domain.com'
+const ALLOWED_ORIGIN = '*';
+/* ================================================================= */
+
+header( 'Access-Control-Allow-Origin: ' . ALLOWED_ORIGIN );
+header( 'Access-Control-Allow-Methods: GET, POST, OPTIONS' );
+header( 'Access-Control-Allow-Headers: Content-Type, Accept, X-Requested-With' );
+header( 'Content-Type: application/json; charset=utf-8' );
+if ( ( $_SERVER['REQUEST_METHOD'] ?? '' ) === 'OPTIONS' ) {
+	http_response_code( 204 );
+	exit;
 }
 
-// Accept params from GET or POST (JSON body or form fields)
-function param($key, $default = '') {
-    if (isset($_POST[$key])) return $_POST[$key];
-    if (isset($_GET[$key])) return $_GET[$key];
-    static $jsonBody = null;
-    if ($jsonBody === null) {
-        $raw = file_get_contents('php://input');
-        $jsonBody = json_decode($raw, true);
-        if (!is_array($jsonBody)) $jsonBody = [];
-    }
-    return isset($jsonBody[$key]) ? $jsonBody[$key] : $default;
+function out( $arr, $code = 200 ) {
+	http_response_code( $code );
+	echo json_encode( $arr, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+	exit;
 }
 
-$baseUrl        = rtrim(param('baseUrl'), '/');   // e.g. http://103.48.119.37:2300
-$apikey         = param('apikey');
-$secretkey      = param('secretkey');
-$callerID       = param('callerID');
-$toUser         = param('toUser');
-$messageContent = param('messageContent');
-
-if (!$baseUrl || !$apikey || !$secretkey || !$callerID || !$toUser || !$messageContent) {
-    http_response_code(400);
-    echo json_encode(['Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Missing required parameter', 'Message_ID' => '-1']);
-    exit;
+/* ---------- 1. Collect input from every possible place ---------- */
+$in  = array();
+$raw = file_get_contents( 'php://input' );
+if ( $raw !== '' && $raw !== false ) {
+	$json = json_decode( $raw, true );
+	if ( is_array( $json ) ) {
+		$in = $json;
+	} else {
+		parse_str( $raw, $form );
+		if ( is_array( $form ) ) {
+			$in = $form;
+		}
+	}
+}
+$in = array_merge( $_GET, $_POST, $in ); // body wins over query string
+// flatten one level (e.g. {"sms": {...}} or {"data": {...}})
+foreach ( array( 'data', 'sms', 'payload', 'params' ) as $wrap ) {
+	if ( isset( $in[ $wrap ] ) && is_array( $in[ $wrap ] ) ) {
+		$in = array_merge( $in, $in[ $wrap ] );
+	}
+}
+$lower = array();
+foreach ( $in as $k => $v ) {
+	if ( ! is_array( $v ) ) {
+		$lower[ strtolower( str_replace( array( '_', '-' ), '', $k ) ) ] = trim( (string) $v );
+	} elseif ( in_array( strtolower( $k ), array( 'to', 'touser', 'numbers', 'number', 'phones' ), true ) ) {
+		$lower[ strtolower( $k ) ] = implode( ',', $v ); // array of numbers
+	}
+}
+function pick( $lower, $names, $default = '' ) {
+	foreach ( $names as $n ) {
+		$n = strtolower( str_replace( array( '_', '-' ), '', $n ) );
+		if ( isset( $lower[ $n ] ) && $lower[ $n ] !== '' ) {
+			return $lower[ $n ];
+		}
+	}
+	return $default;
 }
 
-$url = $baseUrl . '/sendtext'
-     . '?apikey=' . urlencode($apikey)
-     . '&secretkey=' . urlencode($secretkey)
-     . '&callerID=' . urlencode($callerID)
-     . '&toUser=' . urlencode($toUser)
-     . '&messageContent=' . urlencode($messageContent);
+$base    = AGI_BASE_URL;
+$apikey  = pick( $lower, array( 'apikey', 'key', 'token', 'apitoken' ), DEFAULT_APIKEY );
+$secret  = pick( $lower, array( 'secretkey', 'secret', 'apisecret' ), DEFAULT_SECRETKEY );
+$caller  = pick( $lower, array( 'callerid', 'caller', 'senderid', 'sender', 'from', 'masking', 'mask' ), DEFAULT_CALLERID );
+$to      = pick( $lower, array( 'touser', 'to', 'number', 'numbers', 'phone', 'mobile', 'msisdn', 'contacts', 'recipient' ) );
+$message = pick( $lower, array( 'messagecontent', 'message', 'msg', 'text', 'sms', 'content', 'body' ) );
 
-$ch = curl_init($url);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_TIMEOUT, 20);
-curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // baseUrl is plain http anyway
-$response = curl_exec($ch);
-$err = curl_error($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-curl_close($ch);
+/* ---------- 2. Normalize numbers -> 8801XXXXXXXXX ---------- */
+$nums = array();
+foreach ( preg_split( '/[\s,;]+/', $to ) as $n ) {
+	$d = preg_replace( '/\D+/', '', $n );
+	if ( $d === '' ) {
+		continue;
+	}
+	if ( strpos( $d, '00880' ) === 0 ) {
+		$d = substr( $d, 4 );
+	} elseif ( strpos( $d, '880' ) === 0 ) {
+		$d = substr( $d, 3 );
+	}
+	if ( strlen( $d ) === 10 && $d[0] === '1' ) {
+		$d = '0' . $d;
+	}
+	if ( preg_match( '/^01[3-9]\d{8}$/', $d ) ) {
+		$nums[] = '88' . $d;
+	}
+}
+$nums = array_values( array_unique( $nums ) );
 
-if ($response === false) {
-    http_response_code(502);
-    echo json_encode(['Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Upstream error: ' . $err, 'Message_ID' => '-1']);
-    exit;
+/* ---------- 3. Debug mode ---------- */
+$mask = function ( $s ) { return $s === '' ? '(EMPTY)' : '***' . substr( $s, -3 ); };
+if ( isset( $_GET['debug'] ) ) {
+	out( array(
+		'debug'          => true,
+		'method'         => $_SERVER['REQUEST_METHOD'] ?? '',
+		'content_type'   => $_SERVER['CONTENT_TYPE'] ?? '',
+		'received_keys'  => array_keys( $in ),
+		'base'           => $base,
+		'apikey'         => $mask( $apikey ),
+		'secretkey'      => $mask( $secret ),
+		'callerID'       => $caller === '' ? '(EMPTY)' : $caller,
+		'toUser_raw'     => $to === '' ? '(EMPTY)' : $to,
+		'toUser_valid'   => $nums,
+		'messageContent' => $message === '' ? '(EMPTY)' : $message,
+		'note'           => 'Debug only — no SMS sent.',
+	) );
 }
 
-// Pass through AGI's response as-is
-http_response_code(200);
-echo $response;
+/* ---------- 4. Validate: say exactly what's missing ---------- */
+$missing = array();
+if ( $apikey === '' )  { $missing[] = 'apikey (API Key)'; }
+if ( $secret === '' )  { $missing[] = 'secretkey (Secret Key)'; }
+if ( $caller === '' )  { $missing[] = 'callerID (Sender / Caller ID)'; }
+if ( $to === '' )      { $missing[] = 'toUser (customer phone number)'; }
+elseif ( ! $nums )     { $missing[] = 'toUser — number invalid: "' . $to . '" (01XXXXXXXXX hote hobe)'; }
+if ( $message === '' ) { $missing[] = 'messageContent (message text)'; }
+if ( $missing ) {
+	out( array(
+		'Status'            => '-1',
+		'Text'              => 'REJECTD',
+		'StatusDescription' => 'Proxy: missing ' . implode( ', ', $missing ),
+		'Missing'           => $missing,
+		'Received'          => array_keys( $in ),
+		'Message_ID'        => '-1',
+	), 400 );
+}
+if ( ! preg_match( '#^https?://#i', $base ) ) {
+	out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy: invalid base URL "' . $base . '"' ), 400 );
+}
+
+/* ---------- 5. Forward to AGI (one request per number) ---------- */
+function agi_get( $url ) {
+	if ( function_exists( 'curl_init' ) ) {
+		$ch = curl_init( $url );
+		curl_setopt_array( $ch, array( CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30, CURLOPT_CONNECTTIMEOUT => 10 ) );
+		$body = curl_exec( $ch );
+		$err  = curl_error( $ch );
+		$code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+		curl_close( $ch );
+		return array( $code, $body === false ? '' : $body, $err );
+	}
+	$ctx  = stream_context_create( array( 'http' => array( 'timeout' => 30, 'ignore_errors' => true ) ) );
+	$body = @file_get_contents( $url, false, $ctx );
+	return array( $body === false ? 0 : 200, (string) $body, $body === false ? 'connection failed' : '' );
+}
+
+$endpoint = rtrim( $base, '/' ) . '/' . ltrim( AGI_SEND_PATH, '/' );
+$results  = array();
+foreach ( $nums as $n ) {
+	$q = http_build_query( array(
+		'apikey'         => $apikey,
+		'secretkey'      => $secret,
+		'callerID'       => $caller,
+		'toUser'         => $n,
+		'messageContent' => $message,
+	), '', '&', PHP_QUERY_RFC3986 );
+	list( $code, $body, $err ) = agi_get( $endpoint . '?' . $q );
+	$j = json_decode( $body, true );
+	$results[] = is_array( $j ) ? $j + array( 'toUser' => $n ) : array(
+		'Status' => '-1', 'Text' => 'REJECTD', 'toUser' => $n,
+		'StatusDescription' => $err ? 'Proxy could not reach AGI: ' . $err : 'Non-JSON reply (HTTP ' . $code . '): ' . substr( $body, 0, 200 ),
+	);
+}
+
+// Single number -> return AGI's reply as-is (POS expects this). Multiple -> summary + details.
+if ( count( $results ) === 1 ) {
+	out( $results[0] );
+}
+$ok = count( array_filter( $results, function ( $r ) { return isset( $r['Status'] ) && (string) $r['Status'] === '0'; } ) );
+out( array(
+	'Status'  => $ok === count( $results ) ? '0' : '-1',
+	'Text'    => $ok === count( $results ) ? 'ACCEPTD' : 'PARTIAL',
+	'Sent'    => $ok,
+	'Failed'  => count( $results ) - $ok,
+	'Results' => $results,
+) );
