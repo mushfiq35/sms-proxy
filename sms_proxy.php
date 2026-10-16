@@ -168,12 +168,19 @@ $jobs = array_values( array_filter( $jobs, function ( $j ) use ( &$seen ) {
 } ) );
 
 /* ---------- 3. Request snapshot (for debug / ?last=1) ---------- */
+function mask_str( $s ) {
+	return preg_replace_callback( '/((?:api_?key|secret_?key|secret|token)=)([^&\s"]+)/i', function ( $m ) {
+		return $m[1] . '***' . substr( $m[2], -3 );
+	}, $s );
+}
 function mask_tree( $a ) {
 	foreach ( $a as $k => $v ) {
 		if ( is_array( $v ) ) {
 			$a[ $k ] = mask_tree( $v );
 		} elseif ( in_array( nkey( $k ), array_merge( K_APIKEY, K_SECRET ), true ) ) {
 			$a[ $k ] = '***' . substr( (string) $v, -3 );
+		} else {
+			$a[ $k ] = mask_str( (string) $v );
 		}
 	}
 	return $a;
@@ -185,7 +192,7 @@ $snapshot = array(
 	'content_type'   => $_SERVER['CONTENT_TYPE'] ?? '',
 	'origin'         => $_SERVER['HTTP_ORIGIN'] ?? '',
 	'received'       => mask_tree( $in ),
-	'raw_body_start' => preg_replace( '/((?:api_?key|secret_?key|secret|token)["\'=:\s]+)[^&"\',\s}]+/i', '$1***', substr( $raw, 0, 400 ) ),
+	'raw_body_start' => mask_str( preg_replace( '/((?:api_?key|secret_?key|secret|token)["\':\s]+)[^&"\',\s}]+/i', '$1***', substr( $raw, 0, 400 ) ) ),
 	'apikey'         => $mask( $apikey ),
 	'secretkey'      => $mask( $secret ),
 	'callerID'       => $caller === '' ? '(EMPTY)' : $caller,
@@ -204,6 +211,65 @@ if ( ! isset( $_GET['debug'] ) ) {
 }
 if ( isset( $_GET['debug'] ) ) {
 	out( array( 'debug' => true, 'note' => 'Debug only — no SMS sent.' ) + $snapshot );
+}
+
+function agi_get( $url ) {
+	if ( function_exists( 'curl_init' ) ) {
+		$ch = curl_init( $url );
+		curl_setopt_array( $ch, array( CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30, CURLOPT_CONNECTTIMEOUT => 10 ) );
+		$body = curl_exec( $ch );
+		$err  = curl_error( $ch );
+		$code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+		curl_close( $ch );
+		return array( $code, $body === false ? '' : $body, $err );
+	}
+	$ctx  = stream_context_create( array( 'http' => array( 'timeout' => 30, 'ignore_errors' => true ) ) );
+	$body = @file_get_contents( $url, false, $ctx );
+	return array( $body === false ? 0 : 200, (string) $body, $body === false ? 'connection failed' : '' );
+}
+
+/* ---------- 3b. POS "url" mode: ?url=http://AGI_IP:PORT/sendtext?apikey=..&toUser=.. ---------- */
+$full_url = '';
+foreach ( $in as $k => $v ) {
+	if ( ! is_array( $v ) && in_array( nkey( $k ), array( 'url', 'target', 'targeturl', 'endpoint', 'u' ), true ) && preg_match( '#^https?://#i', trim( $v ) ) ) {
+		$full_url = trim( $v );
+		break;
+	}
+}
+if ( $full_url !== '' ) {
+	$want = parse_url( AGI_BASE_URL );
+	$got  = parse_url( $full_url );
+	$same = isset( $got['host'] ) && strcasecmp( $got['host'], $want['host'] ?? '' ) === 0
+		&& (int) ( $got['port'] ?? 80 ) === (int) ( $want['port'] ?? 80 );
+	if ( ! $same ) {
+		out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy: url host not allowed (only ' . ( $want['host'] ?? '' ) . ':' . ( $want['port'] ?? 80 ) . ')', 'Message_ID' => '-1' ), 403 );
+	}
+	$path = $got['path'] ?? '/';
+	if ( ! preg_match( '#^/[A-Za-z0-9_\-/]*$#', $path ) ) {
+		out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy: bad path', 'Message_ID' => '-1' ), 400 );
+	}
+	parse_str( $got['query'] ?? '', $qp );
+	// fill keys from Render env if the POS left them out
+	if ( empty( $qp['apikey'] ) && DEFAULT_APIKEY !== '' )       { $qp['apikey'] = DEFAULT_APIKEY; }
+	if ( empty( $qp['secretkey'] ) && DEFAULT_SECRETKEY !== '' ) { $qp['secretkey'] = DEFAULT_SECRETKEY; }
+	if ( stripos( $path, 'sendtext' ) !== false ) {
+		if ( empty( $qp['callerID'] ) && DEFAULT_CALLERID !== '' ) { $qp['callerID'] = DEFAULT_CALLERID; }
+		if ( ! empty( $qp['toUser'] ) ) {
+			$fixed = array();
+			foreach ( preg_split( '/[\s,;]+/', $qp['toUser'], -1, PREG_SPLIT_NO_EMPTY ) as $ph ) {
+				$fixed[] = norm_phone( $ph ) ?: $ph;
+			}
+			$qp['toUser'] = implode( ',', $fixed );
+		}
+	}
+	$fwd = rtrim( AGI_BASE_URL, '/' ) . $path . ( $qp ? '?' . http_build_query( $qp, '', '&', PHP_QUERY_RFC3986 ) : '' );
+	list( $code, $resp, $err ) = agi_get( $fwd );
+	if ( $resp === '' && $err !== '' ) {
+		out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy could not reach AGI: ' . $err, 'Message_ID' => '-1' ), 502 );
+	}
+	http_response_code( $code ?: 200 );
+	echo $resp; // pass AGI reply through as-is
+	exit;
 }
 
 /* ---------- 4. Validate: say exactly what's missing ---------- */
@@ -229,20 +295,6 @@ if ( $missing ) {
 }
 
 /* ---------- 5. Forward to AGI (one request per number) ---------- */
-function agi_get( $url ) {
-	if ( function_exists( 'curl_init' ) ) {
-		$ch = curl_init( $url );
-		curl_setopt_array( $ch, array( CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30, CURLOPT_CONNECTTIMEOUT => 10 ) );
-		$body = curl_exec( $ch );
-		$err  = curl_error( $ch );
-		$code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
-		curl_close( $ch );
-		return array( $code, $body === false ? '' : $body, $err );
-	}
-	$ctx  = stream_context_create( array( 'http' => array( 'timeout' => 30, 'ignore_errors' => true ) ) );
-	$body = @file_get_contents( $url, false, $ctx );
-	return array( $body === false ? 0 : 200, (string) $body, $body === false ? 'connection failed' : '' );
-}
 
 $endpoint = rtrim( $base, '/' ) . '/' . ltrim( AGI_SEND_PATH, '/' );
 $results  = array();
