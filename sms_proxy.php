@@ -10,17 +10,16 @@
  */
 
 /* ======================= CONFIG (optional) ======================= */
-// AGI server. Always used (the app's Base URL is ignored for security, so no one can misuse the proxy).
-const AGI_BASE_URL   = 'http://103.48.119.37:2300';
-const AGI_SEND_PATH  = '/sendtext';
-
-// Leave '' to take these from the app. Fill them in to keep keys off the browser (recommended).
-const DEFAULT_APIKEY    = '';
-const DEFAULT_SECRETKEY = '';
-const DEFAULT_CALLERID  = '';   // e.g. 8809617640273 or your masking name
+// Values come from Render > Environment (recommended, keeps keys out of GitHub).
+// The text after ?: is only a fallback if the environment variable is not set.
+define( 'AGI_BASE_URL',      getenv( 'AGI_BASE_URL' )   ?: 'http://103.48.119.37:2300' );
+define( 'AGI_SEND_PATH',     getenv( 'AGI_SEND_PATH' )  ?: '/sendtext' );
+define( 'DEFAULT_APIKEY',    getenv( 'AGI_APIKEY' )     ?: '' );   // never write real keys here if the repo is public
+define( 'DEFAULT_SECRETKEY', getenv( 'AGI_SECRETKEY' )  ?: '' );
+define( 'DEFAULT_CALLERID',  getenv( 'AGI_CALLERID' )   ?: '' );   // e.g. 8809617640273 or masking name
 
 // Which websites may call this proxy. '*' = any. Better: 'https://your-pos-domain.com'
-const ALLOWED_ORIGIN = '*';
+define( 'ALLOWED_ORIGIN', getenv( 'ALLOWED_ORIGIN' ) ?: '*' );
 /* ================================================================= */
 
 header( 'Access-Control-Allow-Origin: ' . ALLOWED_ORIGIN );
