@@ -1,31 +1,62 @@
 <?php
 /**
- * sms_proxy.php — Bridge between an HTTPS app (POS) and the AGI SMS HTTP server (http://IP:PORT)
+ * sms_proxy.php v6 — one secure SMS gateway for all client apps.
  *
- * - Accepts GET, POST form-data, x-www-form-urlencoded, or JSON body
- * - Accepts many parameter name variants (apikey / api_key / apiKey ...)
- * - Tells you EXACTLY which field is missing instead of AGI's "Missing required parameter"
- * - Optional: put your keys here so the POS never needs to send them
- * - Debug: add  ?debug=1  to see what the proxy received (keys hidden), nothing is sent
+ *   App (browser) ──[Firebase login token]──▶ this proxy (Render) ──[AGI keys]──▶ AGI SMS (http://IP:PORT)
+ *
+ * - AGI API key / secret key live ONLY here (Render Environment). Browsers never see them.
+ * - Every request must carry a valid Firebase login of a MEMBER of a known client app (tenants.php).
+ * - For billed clients the SMS balance is kept on the server (Firestore of the billing project,
+ *   written with a service account). Clients cannot raise their own balance.
+ * - Recharge / set balance only with a login of the billing project (Piconet Client Manager) + OWNER_EMAILS.
+ *
+ * Render > Environment:
+ *   AGI_APIKEY, AGI_SECRETKEY   AGI keys (required)
+ *   FIREBASE_SA_JSON            service-account JSON of the billing project (or Secret File /etc/secrets/firebase-sa.json)
+ *   BILLING_PROJECT             default: piconet-cms
+ *   OWNER_EMAILS                who may recharge, comma list (default mushfiq35@gmail.com)
+ *   ALLOWED_ORIGIN              e.g. https://piconetit.com  (or * )
+ *   AGI_BASE_URL                default http://103.48.119.37:2300
+ *   DEBUG_MODE=1                only while testing: ?debug=1 shows config (no secrets)
+ *
+ * Actions (POST JSON, header  Authorization: Bearer <Firebase ID token>):
+ *   send     {toUser, messageContent, callerID}            (default action)
+ *   balance  {}                                             → this app's balance
+ *   accounts {}                                             → all clients + balances   (owner only)
+ *   recharge {tenant, type:"masking|nonmasking", amount, mode:"add|set"}   (owner only)
+ *   createUser      {email, password, name}   create a login in THIS app's Firebase  (app admins only)
+ *   setUserDisabled {email, disabled:true|false}  block / unblock a login              (app admins only)
+ *     → lets you turn OFF public sign-up in Firebase, so strangers can't create accounts,
+ *       while your clients still add staff from inside the app. Needs the service account to have
+ *       the "Firebase Authentication Admin" role in that client's Google Cloud project.
  */
 
-/* ======================= CONFIG (optional) ======================= */
-// Values come from Render > Environment (recommended, keeps keys out of GitHub).
-// The text after ?: is only a fallback if the environment variable is not set.
-define( 'AGI_BASE_URL',      getenv( 'AGI_BASE_URL' )   ?: 'http://103.48.119.37:2300' );
-define( 'AGI_SEND_PATH',     getenv( 'AGI_SEND_PATH' )  ?: '/sendtext' );
-define( 'DEFAULT_APIKEY',    getenv( 'AGI_APIKEY' )     ?: '' );   // never write real keys here if the repo is public
-define( 'DEFAULT_SECRETKEY', getenv( 'AGI_SECRETKEY' )  ?: '' );
-define( 'DEFAULT_CALLERID',  getenv( 'AGI_CALLERID' )   ?: '' );   // e.g. 8809617640273 or masking name
-
-// Which websites may call this proxy. '*' = any. Better: 'https://your-pos-domain.com'
-define( 'ALLOWED_ORIGIN', getenv( 'ALLOWED_ORIGIN' ) ?: '*' );
-/* ================================================================= */
+/* =============================== CONFIG =============================== */
+function env( $k, $d = '' ) { $v = getenv( $k ); return ( $v === false || trim( $v ) === '' ) ? $d : trim( $v ); }
+define( 'AGI_BASE_URL',     env( 'AGI_BASE_URL', 'http://103.48.119.37:2300' ) );
+define( 'AGI_SEND_PATH',    env( 'AGI_SEND_PATH', '/sendtext' ) );
+define( 'AGI_APIKEY',       env( 'AGI_APIKEY' ) );
+define( 'AGI_SECRETKEY',    env( 'AGI_SECRETKEY' ) );
+define( 'ALLOWED_ORIGIN',   env( 'ALLOWED_ORIGIN', '*' ) );
+define( 'BILLING_PROJECT',  env( 'BILLING_PROJECT', 'piconet-cms' ) );
+define( 'OWNER_EMAILS',     strtolower( env( 'OWNER_EMAILS', 'mushfiq35@gmail.com' ) ) );
+define( 'DEBUG_MODE',       env( 'DEBUG_MODE' ) === '1' );
+define( 'MEMBER_CACHE_MIN', max( 1, (int) env( 'MEMBER_CACHE_MIN', '15' ) ) ); // member check is re-read at most every N minutes per user
+define( 'LEDGER',           env( 'LEDGER', '1' ) === '1' );                     // 1 write per SMS batch (no reads)
+define( 'GOOGLE_CERTS_URL', env( 'GOOGLE_CERTS_URL', 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com' ) );
+define( 'FIRESTORE_BASE',   env( 'FIRESTORE_BASE', 'https://firestore.googleapis.com/v1' ) );
+define( 'OAUTH_TOKEN_URL',  env( 'OAUTH_TOKEN_URL', '' ) ); // test override only
+define( 'IDTK_BASE',        env( 'IDTK_BASE', 'https://identitytoolkit.googleapis.com/v1' ) );
+define( 'TMP',              sys_get_temp_dir() );
+$TENANTS = require __DIR__ . '/tenants.php';
+/* ===================================================================== */
 
 header( 'Access-Control-Allow-Origin: ' . ALLOWED_ORIGIN );
+header( 'Vary: Origin' );
 header( 'Access-Control-Allow-Methods: GET, POST, OPTIONS' );
-header( 'Access-Control-Allow-Headers: Content-Type, Accept, X-Requested-With' );
+header( 'Access-Control-Allow-Headers: Content-Type, Accept, Authorization' );
 header( 'Content-Type: application/json; charset=utf-8' );
+header( 'Cache-Control: no-store' );
 if ( ( $_SERVER['REQUEST_METHOD'] ?? '' ) === 'OPTIONS' ) {
 	http_response_code( 204 );
 	exit;
@@ -36,294 +67,528 @@ function out( $arr, $code = 200 ) {
 	echo json_encode( $arr, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 	exit;
 }
+function reject( $why, $code = 400, $extra = array() ) {
+	out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy: ' . $why, 'Message_ID' => '-1' ) + $extra, $code );
+}
 
-/* ---------- 1. Collect input from every possible place ---------- */
-$raw = file_get_contents( 'php://input' );
-$raw = $raw === false ? '' : $raw;
+/* ------------------------------ HTTP helper ------------------------------ */
+function http( $method, $url, $headers = array(), $body = null, $timeout = 20 ) {
+	$ch = curl_init( $url );
+	$opt = array( CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => 10, CURLOPT_CUSTOMREQUEST => $method, CURLOPT_HTTPHEADER => $headers, CURLOPT_HEADER => true );
+	if ( $body !== null ) {
+		$opt[ CURLOPT_POSTFIELDS ] = $body;
+	}
+	curl_setopt_array( $ch, $opt );
+	$resp = curl_exec( $ch );
+	$err  = curl_error( $ch );
+	$code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+	$hs   = (int) curl_getinfo( $ch, CURLINFO_HEADER_SIZE );
+	curl_close( $ch );
+	if ( $resp === false ) {
+		return array( 0, '', '', $err );
+	}
+	return array( $code, substr( $resp, $hs ), substr( $resp, 0, $hs ), '' );
+}
+
+/* ------------------------------ Input ------------------------------ */
+$raw  = (string) file_get_contents( 'php://input' );
 $body = array();
 if ( $raw !== '' ) {
-	$json = json_decode( $raw, true );
-	if ( is_array( $json ) ) {
-		$body = $json;
+	$j = json_decode( $raw, true );
+	if ( is_array( $j ) ) {
+		$body = $j;
 	} else {
-		parse_str( $raw, $form );
-		if ( is_array( $form ) ) {
-			$body = $form;
-		}
+		parse_str( $raw, $f );
+		$body = is_array( $f ) ? $f : array();
 	}
 }
-$in = array_merge( $_GET, $_POST, $body ); // body wins over query string
-unset( $in['debug'], $in['last'] );
-
-function nkey( $k ) { return strtolower( preg_replace( '/[^a-z0-9]/i', '', (string) $k ) ); }
-function is_list( $a ) { return is_array( $a ) && $a !== array() && array_keys( $a ) === range( 0, count( $a ) - 1 ); }
-
-const K_APIKEY = array( 'apikey', 'key', 'token', 'apitoken' );
-const K_SECRET = array( 'secretkey', 'secret', 'apisecret' );
-const K_CALLER = array( 'callerid', 'caller', 'senderid', 'sender', 'from', 'masking', 'mask' );
-const K_TO     = array( 'touser', 'to', 'number', 'numbers', 'phone', 'phones', 'phonenumber', 'mobile', 'mobileno', 'mobilenumber', 'msisdn', 'contact', 'contacts', 'recipient', 'recipients', 'customerphone', 'customermobile', 'cell', 'receiver' );
-const K_MSG    = array( 'messagecontent', 'message', 'msg', 'text', 'sms', 'smstext', 'content', 'body', 'messagebody', 'msgbody' );
-const K_NAME   = array( 'name', 'customername', 'customer', 'fullname' );
-
-/** Find first scalar value whose key matches, searching top level first, then nested (breadth-first). */
-function find_val( $arr, $names ) {
-	$queue = array( $arr );
-	while ( $queue ) {
-		$cur = array_shift( $queue );
-		foreach ( $names as $want ) {
-			foreach ( $cur as $k => $v ) {
-				if ( ! is_array( $v ) && nkey( $k ) === $want && trim( (string) $v ) !== '' ) {
-					return trim( (string) $v );
-				}
-			}
-		}
-		foreach ( $cur as $k => $v ) {
-			if ( is_array( $v ) && ! is_list( $v ) ) {
-				$queue[] = $v;
-			}
+$in = array_merge( $_GET, $_POST, $body );
+function pick( $in, $names ) {
+	foreach ( $in as $k => $v ) {
+		if ( ! is_array( $v ) && in_array( strtolower( preg_replace( '/[^a-z0-9]/i', '', $k ) ), $names, true ) && trim( (string) $v ) !== '' ) {
+			return trim( (string) $v );
 		}
 	}
 	return '';
 }
-
-/** List of plain numbers under a phone-ish key, e.g. "to": ["017..","018.."] */
-function find_number_list( $arr ) {
-	foreach ( $arr as $k => $v ) {
-		if ( is_list( $v ) && in_array( nkey( $k ), K_TO, true ) && ! is_array( $v[0] ) ) {
-			return implode( ',', $v );
-		}
-		if ( is_array( $v ) && ! is_list( $v ) ) {
-			$r = find_number_list( $v );
-			if ( $r !== '' ) {
-				return $r;
-			}
-		}
-	}
-	return '';
+// older apps send everything inside ?url=http://AGI/sendtext?... — unpack it (its keys are ignored)
+$legacy = pick( $in, array( 'url' ) );
+if ( $legacy !== '' && preg_match( '#^https?://#i', $legacy ) ) {
+	parse_str( (string) parse_url( $legacy, PHP_URL_QUERY ), $qp );
+	$in = array_merge( $qp, $in );
 }
 
-/** List of recipient objects, e.g. "recipients":[{"name":"Rahim","phone":"017.."}] or [{"to":..,"message":..}] */
-function find_object_list( $arr ) {
-	foreach ( $arr as $k => $v ) {
-		if ( is_list( $v ) && is_array( $v[0] ) && find_val( $v[0], K_TO ) !== '' ) {
-			return $v;
-		}
-		if ( is_array( $v ) && ! is_list( $v ) ) {
-			$r = find_object_list( $v );
-			if ( $r ) {
-				return $r;
-			}
-		}
+/* ------------------------------ Debug (no secrets) ------------------------------ */
+if ( isset( $_GET['debug'] ) ) {
+	if ( ! DEBUG_MODE ) {
+		reject( 'debug is off', 403 );
 	}
-	return is_list( $arr ) && is_array( $arr[0] ) && find_val( $arr[0], K_TO ) !== '' ? $arr : array();
+	out( array(
+		'debug' => true, 'agi_base' => AGI_BASE_URL, 'agi_keys_set' => AGI_APIKEY !== '' && AGI_SECRETKEY !== '',
+		'service_account_set' => sa_json() !== null, 'billing_project' => BILLING_PROJECT, 'owners' => OWNER_EMAILS,
+		'tenants' => array_keys( $TENANTS ), 'origin' => ALLOWED_ORIGIN,
+	) );
 }
 
+/* ============================ Firebase login check ============================ */
+function b64url_dec( $s ) { return base64_decode( strtr( $s, '-_', '+/' ) . str_repeat( '=', ( 4 - strlen( $s ) % 4 ) % 4 ) ); }
+function b64url_enc( $s ) { return rtrim( strtr( base64_encode( $s ), '+/', '-_' ), '=' ); }
+function google_certs( $force = false ) {
+	$cache = TMP . '/sms_proxy_gcerts.json';
+	if ( ! $force && is_file( $cache ) ) {
+		$c = json_decode( (string) @file_get_contents( $cache ), true );
+		if ( is_array( $c ) && ( $c['exp'] ?? 0 ) > time() ) {
+			return $c['keys'];
+		}
+	}
+	list( $code, $b, $h ) = http( 'GET', GOOGLE_CERTS_URL, array(), null, 10 );
+	$keys = json_decode( $b, true );
+	if ( $code !== 200 || ! is_array( $keys ) ) {
+		return array();
+	}
+	$ttl = preg_match( '/max-age=(\d+)/i', $h, $m ) ? (int) $m[1] : 3600;
+	@file_put_contents( $cache, json_encode( array( 'exp' => time() + min( $ttl, 21600 ), 'keys' => $keys ) ) );
+	return $keys;
+}
+/** @return array claims (+ 'project') or string error */
+function verify_login( $jwt, $tenants ) {
+	$p = explode( '.', (string) $jwt );
+	if ( count( $p ) !== 3 ) {
+		return 'login token missing — please log in again';
+	}
+	$h = json_decode( b64url_dec( $p[0] ), true );
+	$c = json_decode( b64url_dec( $p[1] ), true );
+	if ( ! is_array( $h ) || ! is_array( $c ) || ( $h['alg'] ?? '' ) !== 'RS256' || empty( $h['kid'] ) ) {
+		return 'bad login token';
+	}
+	$certs = google_certs();
+	if ( ! isset( $certs[ $h['kid'] ] ) ) {
+		$certs = google_certs( true );
+	}
+	if ( ! isset( $certs[ $h['kid'] ] ) || openssl_verify( $p[0] . '.' . $p[1], b64url_dec( $p[2] ), $certs[ $h['kid'] ], OPENSSL_ALGO_SHA256 ) !== 1 ) {
+		return 'invalid login token';
+	}
+	$proj = (string) ( $c['aud'] ?? '' );
+	if ( ! isset( $tenants[ $proj ] ) && $proj !== BILLING_PROJECT ) {
+		return 'this app (' . $proj . ') is not registered for SMS';
+	}
+	if ( ( $c['iss'] ?? '' ) !== 'https://securetoken.google.com/' . $proj ) {
+		return 'bad token issuer';
+	}
+	$now = time();
+	if ( ( $c['exp'] ?? 0 ) < $now - 30 ) {
+		return 'login expired — reload the app';
+	}
+	if ( ( $c['iat'] ?? 0 ) > $now + 300 || empty( $c['sub'] ) ) {
+		return 'bad token time';
+	}
+	$c['project'] = $proj;
+	$c['email']   = strtolower( trim( (string) ( $c['email'] ?? '' ) ) );
+	return $c;
+}
+/** Reads the member document AS THE USER (that app's Firestore rules apply).
+ *  @return array member doc, or string error. Cached MEMBER_CACHE_MIN minutes → very few reads. */
+function check_member( $claims, $idToken, $tenant ) {
+	$m     = $tenant['members'] ?? array();
+	$email = $claims['email'];
+	if ( $email === '' ) {
+		return 'account has no email';
+	}
+	if ( in_array( $email, array_map( 'strtolower', (array) ( $tenant['primary_emails'] ?? array() ) ), true ) ) {
+		return array( 'role' => (string) ( $tenant['primary_role'] ?? 'super' ) ); // app owner, no member record needed
+	}
+	$cache = TMP . '/sms_proxy_mem_' . md5( $claims['project'] . '|' . $claims['sub'] . '|' . $email );
+	$cacheMin = max( 1, (int) ( $tenant['member_cache_min'] ?? MEMBER_CACHE_MIN ) );
+	if ( is_file( $cache ) && filemtime( $cache ) > time() - $cacheMin * 60 ) {
+		$doc = json_decode( (string) @file_get_contents( $cache ), true );
+		if ( is_array( $doc ) ) {
+			return $doc;
+		}
+	}
+	$url = FIRESTORE_BASE . '/projects/' . rawurlencode( $claims['project'] ) . '/databases/(default)/documents/'
+		. implode( '/', array_map( 'rawurlencode', explode( '/', trim( $m['collection'] ?? 'members', '/' ) ) ) ) . '/' . rawurlencode( ( $m['key'] ?? 'email' ) === 'uid' ? $claims['sub'] : $email );
+	list( $code, $b ) = http( 'GET', $url, array( 'Authorization: Bearer ' . $idToken ), null, 10 );
+	if ( $code !== 200 ) {
+		@unlink( $cache );
+		return in_array( $code, array( 403, 404 ), true ) ? 'user ' . $email . ' is not an active member of this app' : 'could not check membership (HTTP ' . $code . ')';
+	}
+	$doc = fs_decode( json_decode( $b, true )['fields'] ?? array() );
+	foreach ( (array) ( $m['where'] ?? array() ) as $f => $want ) {
+		if ( ( $doc[ $f ] ?? null ) !== $want ) {
+			return 'user ' . $email . ' is not active';
+		}
+	}
+	if ( ! empty( $m['roles'] ) && ! in_array( $doc['role'] ?? '', $m['roles'], true ) ) {
+		return 'user ' . $email . ' has no SMS permission';
+	}
+	@file_put_contents( $cache, json_encode( array( 'role' => (string) ( $doc['role'] ?? '' ) ) ) );
+	return $doc;
+}
+
+/* ============================ Firestore (billing, service account) ============================ */
+function sa_json() {
+	static $sa = false;
+	if ( $sa !== false ) {
+		return $sa;
+	}
+	$raw = env( 'FIREBASE_SA_JSON' );
+	if ( $raw === '' && is_file( '/etc/secrets/firebase-sa.json' ) ) {
+		$raw = (string) file_get_contents( '/etc/secrets/firebase-sa.json' );
+	}
+	if ( $raw !== '' && $raw[0] !== '{' ) {
+		$raw = (string) base64_decode( $raw );
+	}
+	$j  = json_decode( $raw, true );
+	$sa = ( is_array( $j ) && ! empty( $j['private_key'] ) && ! empty( $j['client_email'] ) ) ? $j : null;
+	return $sa;
+}
+function sa_token() {
+	$sa = sa_json();
+	if ( ! $sa ) {
+		return null;
+	}
+	$cache = TMP . '/sms_proxy_sa2_' . md5( $sa['client_email'] ) . '.json';
+	$c     = is_file( $cache ) ? json_decode( (string) @file_get_contents( $cache ), true ) : null;
+	if ( is_array( $c ) && ( $c['exp'] ?? 0 ) > time() + 60 ) {
+		return $c['token'];
+	}
+	$aud = OAUTH_TOKEN_URL ?: ( $sa['token_uri'] ?? 'https://oauth2.googleapis.com/token' );
+	$now = time();
+	$h   = b64url_enc( json_encode( array( 'alg' => 'RS256', 'typ' => 'JWT' ) ) );
+	$p   = b64url_enc( json_encode( array( 'iss' => $sa['client_email'], 'scope' => 'https://www.googleapis.com/auth/cloud-platform', 'aud' => $aud, 'iat' => $now, 'exp' => $now + 3600 ) ) );
+	if ( ! openssl_sign( "$h.$p", $sig, $sa['private_key'], OPENSSL_ALGO_SHA256 ) ) {
+		return null;
+	}
+	list( $code, $b ) = http( 'POST', $aud, array( 'Content-Type: application/x-www-form-urlencoded' ),
+		http_build_query( array( 'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion' => "$h.$p." . b64url_enc( $sig ) ) ), 15 );
+	$j = json_decode( $b, true );
+	if ( $code !== 200 || empty( $j['access_token'] ) ) {
+		return null;
+	}
+	@file_put_contents( $cache, json_encode( array( 'token' => $j['access_token'], 'exp' => $now + (int) ( $j['expires_in'] ?? 3600 ) ) ) );
+	@chmod( $cache, 0600 );
+	return $j['access_token'];
+}
+function fs_root() { return 'projects/' . BILLING_PROJECT . '/databases/(default)/documents'; }
+function fs_call( $method, $path, $body = null ) {
+	$tok = sa_token();
+	if ( ! $tok ) {
+		return array( 0, array( 'error' => 'service account not configured' ) );
+	}
+	list( $code, $b, , $err ) = http( $method, FIRESTORE_BASE . '/' . $path, array( 'Authorization: Bearer ' . $tok, 'Content-Type: application/json' ), $body === null ? null : json_encode( $body ), 15 );
+	return array( $code, $err ? array( 'error' => $err ) : (array) json_decode( $b, true ) );
+}
+function fs_val( $v ) {
+	if ( is_bool( $v ) ) { return array( 'booleanValue' => $v ); }
+	if ( is_int( $v ) ) { return array( 'integerValue' => (string) $v ); }
+	if ( is_float( $v ) ) { return array( 'doubleValue' => $v ); }
+	if ( $v === null ) { return array( 'nullValue' => null ); }
+	return array( 'stringValue' => (string) $v );
+}
+function fs_decode( $fields ) {
+	$o = array();
+	foreach ( (array) $fields as $k => $v ) {
+		if ( isset( $v['integerValue'] ) ) { $o[ $k ] = (int) $v['integerValue']; }
+		elseif ( isset( $v['doubleValue'] ) ) { $o[ $k ] = (float) $v['doubleValue']; }
+		elseif ( array_key_exists( 'booleanValue', $v ) ) { $o[ $k ] = (bool) $v['booleanValue']; }
+		elseif ( isset( $v['stringValue'] ) ) { $o[ $k ] = $v['stringValue']; }
+		else { $o[ $k ] = null; }
+	}
+	return $o;
+}
+function acct_path( $tenantId ) { return fs_root() . '/sms_accounts/' . rawurlencode( $tenantId ); }
+
+/** @return array [masking, nonmasking] or string error */
+function get_balance( $tenantId ) {
+	list( $code, $j ) = fs_call( 'GET', acct_path( $tenantId ) );
+	if ( $code === 404 ) {
+		return array( 'masking' => 0, 'nonmasking' => 0 );
+	}
+	if ( $code !== 200 ) {
+		return 'balance store unavailable (' . ( $j['error']['message'] ?? $j['error'] ?? $code ) . ')';
+	}
+	$d = fs_decode( $j['fields'] ?? array() );
+	return array( 'masking' => (int) ( $d['masking'] ?? 0 ), 'nonmasking' => (int) ( $d['nonmasking'] ?? 0 ) );
+}
+/** Atomically add $delta (can be negative) to one balance — ONE write, ZERO reads.
+ *  Firestore's increment() is atomic and returns the new value. If a deduction would go below 0,
+ *  it is put back at once (one more write) and 'insufficient' is returned.
+ *  With $setTo the balance is simply set. @return int new balance of $type, or string error */
+function change_balance( $tenantId, $type, $delta, $mustCover, $setTo = null ) {
+	$name = acct_path( $tenantId );
+	if ( $setTo !== null ) {
+		$w = array( 'update' => array( 'name' => $name, 'fields' => array( $type => fs_val( (int) $setTo ), 'updatedAt' => fs_val( gmdate( 'c' ) ) ) ),
+			'updateMask' => array( 'fieldPaths' => array( $type, 'updatedAt' ) ) );
+		list( $c, $j ) = fs_call( 'POST', fs_root() . ':commit', array( 'writes' => array( $w ) ) );
+		return $c === 200 ? (int) $setTo : 'balance update failed (' . ( $j['error']['message'] ?? $j['error'] ?? $c ) . ')';
+	}
+	$inc = function ( $d ) use ( $name, $type ) {
+		$w = array(
+			'update'           => array( 'name' => $name, 'fields' => array( 'updatedAt' => fs_val( gmdate( 'c' ) ) ) ),
+			'updateMask'       => array( 'fieldPaths' => array( 'updatedAt' ) ),
+			'updateTransforms' => array( array( 'fieldPath' => $type, 'increment' => array( 'integerValue' => (string) (int) $d ) ) ),
+		);
+		list( $c, $j ) = fs_call( 'POST', fs_root() . ':commit', array( 'writes' => array( $w ) ) );
+		if ( $c !== 200 ) {
+			return 'balance update failed (' . ( $j['error']['message'] ?? $j['error'] ?? $c ) . ')';
+		}
+		$v = $j['writeResults'][0]['transformResults'][0] ?? array();
+		return (int) ( $v['integerValue'] ?? $v['doubleValue'] ?? 0 );
+	};
+	$new = $inc( $delta );
+	if ( is_string( $new ) ) {
+		return $new;
+	}
+	if ( $mustCover && $new < 0 ) {
+		$inc( -$delta ); // put it back
+		return 'insufficient';
+	}
+	return $new;
+}
+function ledger( $row ) {
+	if ( ! LEDGER ) {
+		return;
+	}
+	$fields = array();
+	foreach ( $row as $k => $v ) {
+		$fields[ $k ] = fs_val( $v );
+	}
+	$fields['at'] = fs_val( gmdate( 'c' ) );
+	fs_call( 'POST', fs_root() . '/sms_ledger', array( 'fields' => $fields ) );
+}
+
+/* ============================ SMS helpers ============================ */
 function norm_phone( $n ) {
 	$d = preg_replace( '/\D+/', '', (string) $n );
-	if ( strpos( $d, '00880' ) === 0 ) {
-		$d = substr( $d, 4 );
-	} elseif ( strpos( $d, '880' ) === 0 ) {
-		$d = substr( $d, 3 );
-	}
-	if ( strlen( $d ) === 10 && $d !== '' && $d[0] === '1' ) {
-		$d = '0' . $d;
-	}
+	if ( strpos( $d, '00880' ) === 0 ) { $d = substr( $d, 4 ); }
+	elseif ( strpos( $d, '880' ) === 0 ) { $d = substr( $d, 3 ); }
+	if ( strlen( $d ) === 10 && $d[0] === '1' ) { $d = '0' . $d; }
 	return preg_match( '/^01[3-9]\d{8}$/', $d ) ? '88' . $d : false;
 }
-
-$base    = AGI_BASE_URL;
-$apikey  = find_val( $in, K_APIKEY ) ?: DEFAULT_APIKEY;
-$secret  = find_val( $in, K_SECRET ) ?: DEFAULT_SECRETKEY;
-$caller  = find_val( $in, K_CALLER ) ?: DEFAULT_CALLERID;
-$message = find_val( $in, K_MSG );
-
-/* ---------- 2. Build the send list: [ [number, message], ... ] ---------- */
-$jobs    = array();
-$bad     = array();
-$to_raw  = '';
-$objects = find_object_list( $in );
-if ( $objects ) {
-	foreach ( $objects as $o ) {
-		$ph   = find_val( $o, K_TO );
-		$to_raw .= ( $to_raw ? ',' : '' ) . $ph;
-		$msg  = find_val( $o, K_MSG ) ?: $message;
-		$name = find_val( $o, K_NAME );
-		$msg  = str_replace( '{name}', $name !== '' ? $name : 'Customer', $msg );
-		$n    = norm_phone( $ph );
-		$n ? $jobs[] = array( $n, $msg ) : $bad[] = $ph;
+/** Same counting as the apps: GSM 160/153, Unicode 70/67 */
+function sms_parts( $text ) {
+	static $basic = null, $ext = null;
+	if ( $basic === null ) {
+		$basic = preg_split( '//u', "@£\$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà", -1, PREG_SPLIT_NO_EMPTY );
+		$basic = array_flip( $basic );
+		$ext   = array_flip( preg_split( '//u', "^{}\\[~]|€\f", -1, PREG_SPLIT_NO_EMPTY ) );
 	}
-} else {
-	$to_raw = find_val( $in, K_TO ) ?: find_number_list( $in );
-	foreach ( preg_split( '/[\s,;]+/', $to_raw, -1, PREG_SPLIT_NO_EMPTY ) as $ph ) {
-		$n = norm_phone( $ph );
-		$n ? $jobs[] = array( $n, $message ) : $bad[] = $ph;
+	$len = 0;
+	$uni = false;
+	foreach ( preg_split( '//u', (string) $text, -1, PREG_SPLIT_NO_EMPTY ) as $ch ) {
+		if ( isset( $basic[ $ch ] ) ) { $len += 1; }
+		elseif ( isset( $ext[ $ch ] ) ) { $len += 2; }
+		else { $uni = true; break; }
+	}
+	if ( $uni ) {
+		$len = (int) ( strlen( mb_convert_encoding( (string) $text, 'UTF-16LE', 'UTF-8' ) ) / 2 );
+	}
+	if ( $len === 0 ) {
+		return 0;
+	}
+	$single = $uni ? 70 : 160;
+	$multi  = $uni ? 67 : 153;
+	return $len <= $single ? 1 : (int) ceil( $len / $multi );
+}
+function sender_type( $sender ) { return preg_match( '/^\+?\d+$/', trim( $sender ) ) ? 'nonmasking' : 'masking'; }
+function agi_send( $to, $msg, $sender ) {
+	$q = http_build_query( array( 'apikey' => AGI_APIKEY, 'secretkey' => AGI_SECRETKEY, 'callerID' => $sender, 'toUser' => $to, 'messageContent' => $msg ), '', '&', PHP_QUERY_RFC3986 );
+	list( $code, $b, , $err ) = http( 'GET', rtrim( AGI_BASE_URL, '/' ) . '/' . ltrim( AGI_SEND_PATH, '/' ) . '?' . $q, array(), null, 30 );
+	$j = json_decode( $b, true );
+	if ( is_array( $j ) ) {
+		return $j;
+	}
+	return array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => $err ? 'could not reach AGI: ' . $err : 'AGI reply HTTP ' . $code . ': ' . substr( $b, 0, 150 ) );
+}
+
+/* ============================ 1. Who is calling? ============================ */
+$auth = $_SERVER['HTTP_AUTHORIZATION'] ?? ( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '' );
+if ( $auth === '' && function_exists( 'getallheaders' ) ) {
+	foreach ( getallheaders() as $hk => $hv ) {
+		if ( strcasecmp( $hk, 'Authorization' ) === 0 ) { $auth = $hv; }
 	}
 }
-// de-duplicate same number+message
-$seen = array();
-$jobs = array_values( array_filter( $jobs, function ( $j ) use ( &$seen ) {
-	$k = $j[0] . '|' . md5( $j[1] );
-	if ( isset( $seen[ $k ] ) ) { return false; }
-	return $seen[ $k ] = true;
-} ) );
-
-/* ---------- 3. Request snapshot (for debug / ?last=1) ---------- */
-function mask_str( $s ) {
-	return preg_replace_callback( '/((?:api_?key|secret_?key|secret|token)=)([^&\s"]+)/i', function ( $m ) {
-		return $m[1] . '***' . substr( $m[2], -3 );
-	}, $s );
+$idToken = preg_match( '/^Bearer\s+(\S+)$/i', $auth, $m ) ? $m[1] : pick( $in, array( 'idtoken' ) );
+$user    = verify_login( $idToken, $TENANTS );
+if ( ! is_array( $user ) ) {
+	reject( $user, 401 );
 }
-function mask_tree( $a ) {
-	foreach ( $a as $k => $v ) {
-		if ( is_array( $v ) ) {
-			$a[ $k ] = mask_tree( $v );
-		} elseif ( in_array( nkey( $k ), array_merge( K_APIKEY, K_SECRET ), true ) ) {
-			$a[ $k ] = '***' . substr( (string) $v, -3 );
-		} else {
-			$a[ $k ] = mask_str( (string) $v );
+$tenantId = $user['project'];
+$tenant   = $TENANTS[ $tenantId ] ?? null;
+$isOwner  = $tenantId === BILLING_PROJECT && in_array( $user['email'], array_map( 'trim', explode( ',', OWNER_EMAILS ) ), true );
+
+if ( $tenant ) {
+	$mem = check_member( $user, $idToken, $tenant );
+	if ( ! is_array( $mem ) ) {
+		reject( $mem, 403 );
+	}
+} elseif ( ! $isOwner ) {
+	reject( 'not allowed', 403 );
+}
+
+$action = strtolower( pick( $in, array( 'action' ) ) ?: 'send' );
+
+/* ============================ 2. Owner actions ============================ */
+if ( $action === 'accounts' || $action === 'recharge' ) {
+	if ( ! $isOwner ) {
+		reject( 'only the owner can do this', 403 );
+	}
+	if ( $action === 'recharge' ) {
+		$tid  = pick( $in, array( 'tenant' ) );
+		$type = pick( $in, array( 'type' ) );
+		$amt  = pick( $in, array( 'amount' ) );
+		$mode = pick( $in, array( 'mode' ) ) ?: 'add';
+		if ( ! isset( $TENANTS[ $tid ] ) || empty( $TENANTS[ $tid ]['billing'] ) ) {
+			reject( 'unknown or non-billed client "' . $tid . '"' );
 		}
-	}
-	return $a;
-}
-$mask = function ( $s ) { return $s === '' ? '(EMPTY)' : '***' . substr( $s, -3 ); };
-$snapshot = array(
-	'time'           => gmdate( 'Y-m-d H:i:s' ) . ' UTC',
-	'method'         => $_SERVER['REQUEST_METHOD'] ?? '',
-	'content_type'   => $_SERVER['CONTENT_TYPE'] ?? '',
-	'origin'         => $_SERVER['HTTP_ORIGIN'] ?? '',
-	'received'       => mask_tree( $in ),
-	'raw_body_start' => mask_str( preg_replace( '/((?:api_?key|secret_?key|secret|token)["\':\s]+)[^&"\',\s}]+/i', '$1***', substr( $raw, 0, 400 ) ) ),
-	'apikey'         => $mask( $apikey ),
-	'secretkey'      => $mask( $secret ),
-	'callerID'       => $caller === '' ? '(EMPTY)' : $caller,
-	'toUser_raw'     => $to_raw === '' ? '(EMPTY)' : $to_raw,
-	'valid_numbers'  => count( $jobs ),
-	'messageContent' => $message === '' ? '(EMPTY)' : $message,
-);
-$last_file = sys_get_temp_dir() . '/sms_proxy_last.json';
-
-if ( isset( $_GET['last'] ) ) { // open in browser AFTER pressing SMS in the POS
-	$c = @file_get_contents( $last_file );
-	out( $c ? json_decode( $c, true ) : array( 'note' => 'Ekhono kono request ashe ni (ba server restart hoyeche). POS theke SMS chapun, tarpor abar ?last=1 khulun.' ) );
-}
-if ( ! isset( $_GET['debug'] ) ) {
-	@file_put_contents( $last_file, json_encode( $snapshot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT ) );
-}
-if ( isset( $_GET['debug'] ) ) {
-	out( array( 'debug' => true, 'note' => 'Debug only — no SMS sent.' ) + $snapshot );
-}
-
-function agi_get( $url ) {
-	if ( function_exists( 'curl_init' ) ) {
-		$ch = curl_init( $url );
-		curl_setopt_array( $ch, array( CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30, CURLOPT_CONNECTTIMEOUT => 10 ) );
-		$body = curl_exec( $ch );
-		$err  = curl_error( $ch );
-		$code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
-		curl_close( $ch );
-		return array( $code, $body === false ? '' : $body, $err );
-	}
-	$ctx  = stream_context_create( array( 'http' => array( 'timeout' => 30, 'ignore_errors' => true ) ) );
-	$body = @file_get_contents( $url, false, $ctx );
-	return array( $body === false ? 0 : 200, (string) $body, $body === false ? 'connection failed' : '' );
-}
-
-/* ---------- 3b. POS "url" mode: ?url=http://AGI_IP:PORT/sendtext?apikey=..&toUser=.. ---------- */
-$full_url = '';
-foreach ( $in as $k => $v ) {
-	if ( ! is_array( $v ) && in_array( nkey( $k ), array( 'url', 'target', 'targeturl', 'endpoint', 'u' ), true ) && preg_match( '#^https?://#i', trim( $v ) ) ) {
-		$full_url = trim( $v );
-		break;
-	}
-}
-if ( $full_url !== '' ) {
-	$want = parse_url( AGI_BASE_URL );
-	$got  = parse_url( $full_url );
-	$same = isset( $got['host'] ) && strcasecmp( $got['host'], $want['host'] ?? '' ) === 0
-		&& (int) ( $got['port'] ?? 80 ) === (int) ( $want['port'] ?? 80 );
-	if ( ! $same ) {
-		out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy: url host not allowed (only ' . ( $want['host'] ?? '' ) . ':' . ( $want['port'] ?? 80 ) . ')', 'Message_ID' => '-1' ), 403 );
-	}
-	$path = $got['path'] ?? '/';
-	if ( ! preg_match( '#^/[A-Za-z0-9_\-/]*$#', $path ) ) {
-		out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy: bad path', 'Message_ID' => '-1' ), 400 );
-	}
-	parse_str( $got['query'] ?? '', $qp );
-	// fill keys from Render env if the POS left them out
-	if ( empty( $qp['apikey'] ) && DEFAULT_APIKEY !== '' )       { $qp['apikey'] = DEFAULT_APIKEY; }
-	if ( empty( $qp['secretkey'] ) && DEFAULT_SECRETKEY !== '' ) { $qp['secretkey'] = DEFAULT_SECRETKEY; }
-	if ( stripos( $path, 'sendtext' ) !== false ) {
-		if ( empty( $qp['callerID'] ) && DEFAULT_CALLERID !== '' ) { $qp['callerID'] = DEFAULT_CALLERID; }
-		if ( ! empty( $qp['toUser'] ) ) {
-			$fixed = array();
-			foreach ( preg_split( '/[\s,;]+/', $qp['toUser'], -1, PREG_SPLIT_NO_EMPTY ) as $ph ) {
-				$fixed[] = norm_phone( $ph ) ?: $ph;
-			}
-			$qp['toUser'] = implode( ',', $fixed );
+		if ( ! in_array( $type, array( 'masking', 'nonmasking' ), true ) || ! preg_match( '/^\d{1,7}$/', $amt ) ) {
+			reject( 'type must be masking/nonmasking and amount a whole number' );
 		}
+		$r = $mode === 'set' ? change_balance( $tid, $type, 0, false, (int) $amt ) : change_balance( $tid, $type, (int) $amt, false );
+		if ( ! is_int( $r ) ) {
+			reject( $r, 503 );
+		}
+		ledger( array( 'tenant' => $tid, 'kind' => 'recharge_' . $mode, 'type' => $type, 'credits' => (int) $amt, 'by' => $user['email'] ) );
+		out( array( 'Status' => '0', 'Text' => 'OK', 'tenant' => $tid, 'Type' => $type, 'Balance' => array( $type => $r ) ) );
 	}
-	$fwd = rtrim( AGI_BASE_URL, '/' ) . $path . ( $qp ? '?' . http_build_query( $qp, '', '&', PHP_QUERY_RFC3986 ) : '' );
-	list( $code, $resp, $err ) = agi_get( $fwd );
-	if ( $resp === '' && $err !== '' ) {
-		out( array( 'Status' => '-1', 'Text' => 'REJECTD', 'StatusDescription' => 'Proxy could not reach AGI: ' . $err, 'Message_ID' => '-1' ), 502 );
+	$list = array();
+	foreach ( $TENANTS as $tid => $t ) {
+		$list[] = array( 'tenant' => $tid, 'name' => $t['name'] ?? $tid, 'billing' => ! empty( $t['billing'] ),
+			'Balance' => ! empty( $t['billing'] ) ? get_balance( $tid ) : null, 'senders' => $t['senders'] ?? array() );
 	}
-	http_response_code( $code ?: 200 );
-	echo $resp; // pass AGI reply through as-is
-	exit;
+	out( array( 'Status' => '0', 'Text' => 'OK', 'accounts' => $list ) );
 }
 
-/* ---------- 4. Validate: say exactly what's missing ---------- */
-$missing = array();
-if ( $apikey === '' )  { $missing[] = 'apikey'; }
-if ( $secret === '' )  { $missing[] = 'secretkey'; }
-if ( $caller === '' )  { $missing[] = 'callerID'; }
-if ( $to_raw === '' )  { $missing[] = 'toUser (phone number)'; }
-elseif ( ! $jobs )     { $missing[] = 'toUser invalid "' . substr( $to_raw, 0, 40 ) . '"'; }
-foreach ( $jobs as $j ) {
-	if ( trim( $j[1] ) === '' ) { $missing[] = 'messageContent (text)'; break; }
+if ( ! $tenant ) {
+	reject( 'this login cannot send SMS', 400 );
 }
-if ( $to_raw === '' && $message === '' ) { $missing[] = 'messageContent (text)'; }
-if ( $missing ) {
-	$keys = implode( ',', array_slice( array_keys( $in ), 0, 12 ) );
-	out( array(
-		// short first so it survives truncation in the POS popup
-		'Status'            => '-1',
-		'Text'              => 'REJECTD',
-		'StatusDescription' => 'Proxy got [' . ( $keys ?: 'nothing' ) . '] via ' . $snapshot['method'] . ' ' . ( $snapshot['content_type'] ?: 'no-body' ) . ' — missing: ' . implode( ', ', array_unique( $missing ) ) . '. Details: ?last=1',
-		'Message_ID'        => '-1',
-	), 400 );
+$billing = ! empty( $tenant['billing'] );
+
+/* ============================ 2b. Create / block logins (sign-up can stay OFF in Firebase) ============================ */
+if ( $action === 'createuser' || $action === 'setuserdisabled' ) {
+	$adminRoles = (array) ( $tenant['user_admin_roles'] ?? array() );
+	if ( $adminRoles && ! in_array( (string) ( $mem['role'] ?? '' ), $adminRoles, true ) ) {
+		reject( 'only ' . implode( '/', $adminRoles ) . ' users can manage logins', 403 );
+	}
+	$target = strtolower( pick( $in, array( 'email' ) ) );
+	if ( ! filter_var( $target, FILTER_VALIDATE_EMAIL ) ) {
+		reject( 'valid email required' );
+	}
+	$protected = array_merge( array( $user['email'] ), array_map( 'trim', explode( ',', OWNER_EMAILS ) ), (array) ( $tenant['primary_emails'] ?? array() ) );
+	$tok = sa_token();
+	if ( ! $tok ) {
+		reject( 'service account not configured on the proxy', 500 );
+	}
+	$api = IDTK_BASE . '/projects/' . rawurlencode( $tenantId ) . '/accounts';
+	$hdr = array( 'Authorization: Bearer ' . $tok, 'Content-Type: application/json' );
+	if ( $action === 'createuser' ) {
+		$pass = (string) ( $in['password'] ?? '' );
+		if ( strlen( $pass ) < 6 ) {
+			reject( 'password must be at least 6 characters' );
+		}
+		$req = array( 'email' => $target, 'password' => $pass );
+		if ( ( $nm = pick( $in, array( 'name', 'displayname' ) ) ) !== '' ) {
+			$req['displayName'] = $nm;
+		}
+		list( $c, $b ) = http( 'POST', $api, $hdr, json_encode( $req ), 15 );
+		$j = (array) json_decode( $b, true );
+		if ( $c === 200 && ! empty( $j['localId'] ) ) {
+			out( array( 'Status' => '0', 'Text' => 'OK', 'result' => 'created', 'uid' => $j['localId'] ) );
+		}
+		$msg = (string) ( $j['error']['message'] ?? $c );
+		if ( strpos( $msg, 'EMAIL_EXISTS' ) !== false || strpos( $msg, 'DUPLICATE_EMAIL' ) !== false ) {
+			list( , $lb ) = http( 'POST', $api . ':lookup', $hdr, json_encode( array( 'email' => array( $target ) ) ), 15 );
+			out( array( 'Status' => '0', 'Text' => 'OK', 'result' => 'existing', 'uid' => ( (array) json_decode( $lb, true ) )['users'][0]['localId'] ?? '' ) );
+		}
+		reject( 'could not create login (' . $msg . ')', $c === 403 ? 403 : 502 );
+	}
+	// block / unblock
+	if ( in_array( $target, $protected, true ) ) {
+		reject( 'this account cannot be blocked here', 403 );
+	}
+	$disable = in_array( strtolower( (string) ( $in['disabled'] ?? 'true' ) ), array( '1', 'true', 'yes' ), true );
+	list( $c, $b ) = http( 'POST', $api . ':lookup', $hdr, json_encode( array( 'email' => array( $target ) ) ), 15 );
+	$lid = ( (array) json_decode( $b, true ) )['users'][0]['localId'] ?? '';
+	if ( $c !== 200 ) {
+		reject( 'could not find login (HTTP ' . $c . ')', 502 );
+	}
+	if ( $lid === '' ) {
+		out( array( 'Status' => '0', 'Text' => 'OK', 'result' => 'no_login' ) );
+	}
+	list( $c, $b ) = http( 'POST', $api . ':update', $hdr, json_encode( array( 'localId' => $lid, 'disableUser' => $disable ) ), 15 );
+	if ( $c !== 200 ) {
+		reject( 'could not update login (HTTP ' . $c . ')', 502 );
+	}
+	out( array( 'Status' => '0', 'Text' => 'OK', 'result' => $disable ? 'disabled' : 'enabled' ) );
 }
 
-/* ---------- 5. Forward to AGI (one request per number) ---------- */
-
-$endpoint = rtrim( $base, '/' ) . '/' . ltrim( AGI_SEND_PATH, '/' );
-$results  = array();
-foreach ( $jobs as $job ) {
-	list( $n, $msg ) = $job;
-	$q = http_build_query( array(
-		'apikey'         => $apikey,
-		'secretkey'      => $secret,
-		'callerID'       => $caller,
-		'toUser'         => $n,
-		'messageContent' => $msg,
-	), '', '&', PHP_QUERY_RFC3986 );
-	list( $code, $resp, $err ) = agi_get( $endpoint . '?' . $q );
-	$j = json_decode( $resp, true );
-	$results[] = is_array( $j ) ? $j + array( 'toUser' => $n ) : array(
-		'Status' => '-1', 'Text' => 'REJECTD', 'toUser' => $n,
-		'StatusDescription' => $err ? 'Proxy could not reach AGI: ' . $err : 'Non-JSON reply (HTTP ' . $code . '): ' . substr( $resp, 0, 200 ),
-	);
+/* ============================ 3. Balance ============================ */
+if ( $action === 'balance' ) {
+	if ( ! $billing ) {
+		out( array( 'Status' => '0', 'Text' => 'OK', 'billing' => false, 'Balance' => null ) );
+	}
+	$b = get_balance( $tenantId );
+	if ( ! is_array( $b ) ) {
+		reject( $b, 503 );
+	}
+	out( array( 'Status' => '0', 'Text' => 'OK', 'billing' => true, 'Balance' => $b ) );
+}
+if ( $action !== 'send' ) {
+	reject( 'unknown action' );
 }
 
-// Single number -> return AGI's reply as-is (POS expects this). Multiple -> summary + details.
+/* ============================ 4. Send ============================ */
+if ( AGI_APIKEY === '' || AGI_SECRETKEY === '' ) {
+	reject( 'AGI_APIKEY / AGI_SECRETKEY not set in Render', 500 );
+}
+$sender  = pick( $in, array( 'callerid', 'senderid', 'sender' ) );
+$message = pick( $in, array( 'messagecontent', 'message', 'msg', 'text' ) );
+$toRaw   = pick( $in, array( 'touser', 'to', 'number', 'phone', 'mobile' ) );
+if ( $sender === '' ) { reject( 'callerID (Sender ID) missing' ); }
+if ( $message === '' ) { reject( 'message is empty' ); }
+$allowed = array_map( 'strtolower', (array) ( $tenant['senders'] ?? array() ) );
+if ( $allowed && ! in_array( strtolower( $sender ), $allowed, true ) ) {
+	reject( 'sender "' . $sender . '" is not allowed for this app', 403 );
+}
+$numbers = array();
+foreach ( preg_split( '/[\s,;]+/', $toRaw, -1, PREG_SPLIT_NO_EMPTY ) as $ph ) {
+	if ( $n = norm_phone( $ph ) ) { $numbers[ $n ] = true; }
+}
+$numbers = array_keys( $numbers );
+if ( ! $numbers ) { reject( 'valid phone number missing (01XXXXXXXXX)' ); }
+if ( count( $numbers ) > 100 ) { reject( 'max 100 numbers per request' ); }
+
+$type    = sender_type( $sender );
+$parts   = sms_parts( $message );
+$credits = $parts * count( $numbers );
+
+if ( $billing ) {
+	$r = change_balance( $tenantId, $type, -$credits, true );
+	if ( $r === 'insufficient' ) {
+		reject( 'Insufficient Balance', 402, array( 'Status' => '-4', 'Credits' => $credits, 'Type' => $type ) );
+	}
+	if ( ! is_int( $r ) ) {
+		reject( $r, 503 );
+	}
+}
+
+$results = array();
+$failed  = 0;
+foreach ( $numbers as $n ) {
+	$res = agi_send( (string) $n, $message, $sender ) + array( 'toUser' => (string) $n );
+	if ( (string) ( $res['Status'] ?? '' ) !== '0' ) {
+		$failed++;
+	}
+	$results[] = $res;
+}
+$balance = null;
+if ( $billing ) {
+	$balance = $failed ? change_balance( $tenantId, $type, $failed * $parts, false ) : $r; // refund failed ones
+	ledger( array( 'tenant' => $tenantId, 'kind' => 'send', 'type' => $type, 'credits' => ( count( $numbers ) - $failed ) * $parts,
+		'refunded' => $failed * $parts, 'numbers' => count( $numbers ), 'by' => $user['email'], 'sender' => $sender ) );
+}
+$extra = array( 'Credits' => ( count( $numbers ) - $failed ) * $parts, 'Type' => $type, 'Balance' => is_int( $balance ) ? array( $type => $balance ) : null );
 if ( count( $results ) === 1 ) {
-	out( $results[0] );
+	out( $results[0] + $extra );
 }
-$ok = count( array_filter( $results, function ( $r ) { return isset( $r['Status'] ) && (string) $r['Status'] === '0'; } ) );
-out( array(
-	'Status'  => $ok === count( $results ) ? '0' : '-1',
-	'Text'    => $ok === count( $results ) ? 'ACCEPTD' : 'PARTIAL',
-	'Sent'    => $ok,
-	'Failed'  => count( $results ) - $ok,
-	'Results' => $results,
-) );
+out( array( 'Status' => $failed ? '-1' : '0', 'Text' => $failed ? 'PARTIAL' : 'ACCEPTD', 'Sent' => count( $results ) - $failed, 'Failed' => $failed, 'Results' => $results ) + $extra );
