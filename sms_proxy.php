@@ -126,6 +126,10 @@ if ( isset( $_GET['debug'] ) ) {
 	out( array(
 		'debug' => true, 'agi_base' => AGI_BASE_URL, 'agi_keys_set' => AGI_APIKEY !== '' && AGI_SECRETKEY !== '',
 		'service_account_set' => sa_json() !== null, 'billing_project' => BILLING_PROJECT, 'owners' => OWNER_EMAILS,
+		'sa_files' => array_map( function ( $f ) { return array( 'path' => $f, 'exists' => file_exists( $f ), 'readable' => is_readable( $f ) ); }, array( '/var/private/firebase-sa.json', '/etc/secrets/firebase-sa.json' ) ),
+		'sa_client_email' => ( sa_json()['client_email'] ?? null ), 'sa_project' => ( sa_json()['project_id'] ?? null ),
+		'sa_token_ok' => sa_token() !== null, 'sa_error' => $GLOBALS['SA_ERR'] ?? '',
+		'php_user' => function_exists( 'posix_geteuid' ) ? posix_getpwuid( posix_geteuid() )['name'] : get_current_user(),
 		'tenants' => array_keys( $TENANTS ), 'origin' => ALLOWED_ORIGIN,
 	) );
 }
@@ -245,9 +249,11 @@ function sa_json() {
 	$sa = ( is_array( $j ) && ! empty( $j['private_key'] ) && ! empty( $j['client_email'] ) ) ? $j : null;
 	return $sa;
 }
+$GLOBALS['SA_ERR'] = '';
 function sa_token() {
 	$sa = sa_json();
 	if ( ! $sa ) {
+		$GLOBALS['SA_ERR'] = 'service-account file not found or not valid JSON';
 		return null;
 	}
 	$cache = TMP . '/sms_proxy_sa2_' . md5( $sa['client_email'] ) . '.json';
@@ -260,12 +266,14 @@ function sa_token() {
 	$h   = b64url_enc( json_encode( array( 'alg' => 'RS256', 'typ' => 'JWT' ) ) );
 	$p   = b64url_enc( json_encode( array( 'iss' => $sa['client_email'], 'scope' => 'https://www.googleapis.com/auth/cloud-platform', 'aud' => $aud, 'iat' => $now, 'exp' => $now + 3600 ) ) );
 	if ( ! openssl_sign( "$h.$p", $sig, $sa['private_key'], OPENSSL_ALGO_SHA256 ) ) {
+		$GLOBALS['SA_ERR'] = 'could not sign with private_key (' . openssl_error_string() . ')';
 		return null;
 	}
 	list( $code, $b ) = http( 'POST', $aud, array( 'Content-Type: application/x-www-form-urlencoded' ),
 		http_build_query( array( 'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion' => "$h.$p." . b64url_enc( $sig ) ) ), 15 );
 	$j = json_decode( $b, true );
 	if ( $code !== 200 || empty( $j['access_token'] ) ) {
+		$GLOBALS['SA_ERR'] = 'Google token request failed: HTTP ' . $code . ' ' . substr( (string) ( $j['error_description'] ?? $j['error'] ?? $b ), 0, 200 );
 		return null;
 	}
 	@file_put_contents( $cache, json_encode( array( 'token' => $j['access_token'], 'exp' => $now + (int) ( $j['expires_in'] ?? 3600 ) ) ) );
@@ -276,7 +284,7 @@ function fs_root() { return 'projects/' . BILLING_PROJECT . '/databases/(default
 function fs_call( $method, $path, $body = null ) {
 	$tok = sa_token();
 	if ( ! $tok ) {
-		return array( 0, array( 'error' => 'service account not configured' ) );
+		return array( 0, array( 'error' => 'service account not configured: ' . $GLOBALS['SA_ERR'] ) );
 	}
 	list( $code, $b, , $err ) = http( $method, FIRESTORE_BASE . '/' . $path, array( 'Authorization: Bearer ' . $tok, 'Content-Type: application/json' ), $body === null ? null : json_encode( $body ), 15 );
 	return array( $code, $err ? array( 'error' => $err ) : (array) json_decode( $b, true ) );
