@@ -48,7 +48,15 @@ define( 'FIRESTORE_BASE',   env( 'FIRESTORE_BASE', 'https://firestore.googleapis
 define( 'OAUTH_TOKEN_URL',  env( 'OAUTH_TOKEN_URL', '' ) ); // test override only
 define( 'IDTK_BASE',        env( 'IDTK_BASE', 'https://identitytoolkit.googleapis.com/v1' ) );
 define( 'TMP',              sys_get_temp_dir() );
-$TENANTS = require __DIR__ . '/tenants.php';
+$TENANTS   = require __DIR__ . '/tenants.php';
+$TEMPLATES = (array) ( $TENANTS['@templates'] ?? array() );
+unset( $TENANTS['@templates'] );
+foreach ( $TENANTS as $id => $t ) {                 // listed clients inherit their app template
+	if ( ! empty( $t['template'] ) && isset( $TEMPLATES[ $t['template'] ] ) ) {
+		$TENANTS[ $id ] = array_merge( $TEMPLATES[ $t['template'] ], $t );
+	}
+}
+$GLOBALS['ACCT_META'] = array();                    // name/app written onto this client's balance record
 /* ===================================================================== */
 
 header( 'Access-Control-Allow-Origin: ' . ALLOWED_ORIGIN );
@@ -130,7 +138,7 @@ if ( isset( $_GET['debug'] ) ) {
 		'sa_client_email' => ( sa_json()['client_email'] ?? null ), 'sa_project' => ( sa_json()['project_id'] ?? null ),
 		'sa_token_ok' => sa_token() !== null, 'sa_error' => $GLOBALS['SA_ERR'] ?? '',
 		'php_user' => function_exists( 'posix_geteuid' ) ? posix_getpwuid( posix_geteuid() )['name'] : get_current_user(),
-		'tenants' => array_keys( $TENANTS ), 'origin' => ALLOWED_ORIGIN,
+		'tenants' => array_keys( $TENANTS ), 'templates' => array_keys( $TEMPLATES ), 'origin' => ALLOWED_ORIGIN,
 	) );
 }
 
@@ -173,8 +181,8 @@ function verify_login( $jwt, $tenants ) {
 		return 'invalid login token';
 	}
 	$proj = (string) ( $c['aud'] ?? '' );
-	if ( ! isset( $tenants[ $proj ] ) && $proj !== BILLING_PROJECT ) {
-		return 'this app (' . $proj . ') is not registered for SMS';
+	if ( ! preg_match( '/^[a-z0-9][a-z0-9-]{2,62}$/', $proj ) ) {
+		return 'bad project';
 	}
 	if ( ( $c['iss'] ?? '' ) !== 'https://securetoken.google.com/' . $proj ) {
 		return 'bad token issuer';
@@ -307,12 +315,25 @@ function fs_decode( $fields ) {
 	}
 	return $o;
 }
+function acct_meta_fields() {
+	$f = array();
+	foreach ( (array) $GLOBALS['ACCT_META'] as $k => $v ) {
+		if ( $v !== '' ) { $f[ $k ] = fs_val( (string) $v ); }
+	}
+	return $f;
+}
 function acct_path( $tenantId ) { return fs_root() . '/sms_accounts/' . rawurlencode( $tenantId ); }
 
 /** @return array [masking, nonmasking] or string error */
 function get_balance( $tenantId ) {
 	list( $code, $j ) = fs_call( 'GET', acct_path( $tenantId ) );
 	if ( $code === 404 ) {
+		if ( $GLOBALS['ACCT_META'] ) {   // first time this client is seen → show it in the Client Manager
+			fs_call( 'POST', fs_root() . ':commit', array( 'writes' => array( array(
+				'update' => array( 'name' => acct_path( $tenantId ), 'fields' => array( 'masking' => fs_val( 0 ), 'nonmasking' => fs_val( 0 ), 'createdAt' => fs_val( gmdate( 'c' ) ) ) + acct_meta_fields() ),
+				'currentDocument' => array( 'exists' => false ),
+			) ) ) );
+		}
 		return array( 'masking' => 0, 'nonmasking' => 0 );
 	}
 	if ( $code !== 200 ) {
@@ -328,15 +349,15 @@ function get_balance( $tenantId ) {
 function change_balance( $tenantId, $type, $delta, $mustCover, $setTo = null ) {
 	$name = acct_path( $tenantId );
 	if ( $setTo !== null ) {
-		$w = array( 'update' => array( 'name' => $name, 'fields' => array( $type => fs_val( (int) $setTo ), 'updatedAt' => fs_val( gmdate( 'c' ) ) ) ),
-			'updateMask' => array( 'fieldPaths' => array( $type, 'updatedAt' ) ) );
+		$w = array( 'update' => array( 'name' => $name, 'fields' => array( $type => fs_val( (int) $setTo ), 'updatedAt' => fs_val( gmdate( 'c' ) ) ) + acct_meta_fields() ),
+			'updateMask' => array( 'fieldPaths' => array_merge( array( $type, 'updatedAt' ), array_keys( acct_meta_fields() ) ) ) );
 		list( $c, $j ) = fs_call( 'POST', fs_root() . ':commit', array( 'writes' => array( $w ) ) );
 		return $c === 200 ? (int) $setTo : 'balance update failed (' . ( $j['error']['message'] ?? $j['error'] ?? $c ) . ')';
 	}
 	$inc = function ( $d ) use ( $name, $type ) {
 		$w = array(
-			'update'           => array( 'name' => $name, 'fields' => array( 'updatedAt' => fs_val( gmdate( 'c' ) ) ) ),
-			'updateMask'       => array( 'fieldPaths' => array( 'updatedAt' ) ),
+			'update'           => array( 'name' => $name, 'fields' => array( 'updatedAt' => fs_val( gmdate( 'c' ) ) ) + acct_meta_fields() ),
+			'updateMask'       => array( 'fieldPaths' => array_merge( array( 'updatedAt' ), array_keys( acct_meta_fields() ) ) ),
 			'updateTransforms' => array( array( 'fieldPath' => $type, 'increment' => array( 'integerValue' => (string) (int) $d ) ) ),
 		);
 		list( $c, $j ) = fs_call( 'POST', fs_root() . ':commit', array( 'writes' => array( $w ) ) );
@@ -426,6 +447,22 @@ if ( ! is_array( $user ) ) {
 }
 $tenantId = $user['project'];
 $tenant   = $TENANTS[ $tenantId ] ?? null;
+$appId    = strtolower( pick( $in, array( 'app' ) ) );
+$shopName = trim( preg_replace( '/[\x00-\x1F<>]+/u', ' ', mb_substr( pick( $in, array( 'shop' ) ), 0, 80 ) ) );
+if ( ! $tenant && $tenantId !== BILLING_PROJECT ) {
+	if ( $appId === '' || ! isset( $TEMPLATES[ $appId ] ) ) {
+		reject( 'this app (' . $tenantId . ') is not registered for SMS', 403 );
+	}
+	// New client of a known app: use the app template. Balance starts at 0 → nothing can be sent until you recharge.
+	$tenant = array_merge( $TEMPLATES[ $appId ], array( 'billing' => true, 'name' => $shopName !== '' ? $shopName : $tenantId ) );
+	if ( empty( $user['email_verified'] ) ) {
+		unset( $tenant['primary_emails'] );   // a self-made account in an unknown project must not pass as the owner
+	}
+}
+if ( $tenant && ! empty( $tenant['billing'] ) ) {
+	$GLOBALS['ACCT_META'] = array( 'name' => (string) ( $tenant['name'] ?? $shopName ?: $tenantId ), 'app' => $appId !== '' ? $appId : (string) ( $tenant['template'] ?? '' ) );
+	if ( $shopName !== '' ) { $GLOBALS['ACCT_META']['shop'] = $shopName; }
+}
 $isOwner  = $tenantId === BILLING_PROJECT && in_array( $user['email'], array_map( 'trim', explode( ',', OWNER_EMAILS ) ), true );
 
 if ( $tenant ) {
@@ -449,8 +486,13 @@ if ( $action === 'accounts' || $action === 'recharge' ) {
 		$type = pick( $in, array( 'type' ) );
 		$amt  = pick( $in, array( 'amount' ) );
 		$mode = pick( $in, array( 'mode' ) ) ?: 'add';
-		if ( ! isset( $TENANTS[ $tid ] ) || empty( $TENANTS[ $tid ]['billing'] ) ) {
-			reject( 'unknown or non-billed client "' . $tid . '"' );
+		$known = isset( $TENANTS[ $tid ] ) && ! empty( $TENANTS[ $tid ]['billing'] );
+		if ( ! $known && preg_match( '/^[a-z0-9][a-z0-9-]{2,62}$/', $tid ) ) {
+			list( $kc ) = fs_call( 'GET', acct_path( $tid ) );   // registered by opening the app once
+			$known = $kc === 200;
+		}
+		if ( ! $known ) {
+			reject( 'unknown client "' . $tid . '"' );
 		}
 		if ( ! in_array( $type, array( 'masking', 'nonmasking' ), true ) || ! preg_match( '/^\d{1,7}$/', $amt ) ) {
 			reject( 'type must be masking/nonmasking and amount a whole number' );
@@ -462,11 +504,27 @@ if ( $action === 'accounts' || $action === 'recharge' ) {
 		ledger( array( 'tenant' => $tid, 'kind' => 'recharge_' . $mode, 'type' => $type, 'credits' => (int) $amt, 'by' => $user['email'] ) );
 		out( array( 'Status' => '0', 'Text' => 'OK', 'tenant' => $tid, 'Type' => $type, 'Balance' => array( $type => $r ) ) );
 	}
+	$docs = array();
+	$tok  = '';
+	do {   // reads = number of clients (one list query)
+		list( $lc, $lj ) = fs_call( 'GET', fs_root() . '/sms_accounts?pageSize=300' . ( $tok ? '&pageToken=' . rawurlencode( $tok ) : '' ) );
+		if ( $lc !== 200 ) {
+			reject( 'balance store unavailable (' . ( $lj['error']['message'] ?? $lj['error'] ?? $lc ) . ')', 503 );
+		}
+		foreach ( (array) ( $lj['documents'] ?? array() ) as $d ) {
+			$docs[ rawurldecode( basename( $d['name'] ) ) ] = fs_decode( $d['fields'] ?? array() );
+		}
+		$tok = (string) ( $lj['nextPageToken'] ?? '' );
+	} while ( $tok !== '' );
 	$list = array();
-	foreach ( $TENANTS as $tid => $t ) {
-		$list[] = array( 'tenant' => $tid, 'name' => $t['name'] ?? $tid, 'billing' => ! empty( $t['billing'] ),
-			'Balance' => ! empty( $t['billing'] ) ? get_balance( $tid ) : null, 'senders' => $t['senders'] ?? array() );
+	$ids  = array_unique( array_merge( array_keys( array_filter( $TENANTS, function ( $t ) { return ! empty( $t['billing'] ); } ) ), array_keys( $docs ) ) );
+	foreach ( $ids as $tid ) {
+		$d = $docs[ $tid ] ?? array();
+		$list[] = array( 'tenant' => $tid, 'name' => $TENANTS[ $tid ]['name'] ?? ( $d['shop'] ?? ( $d['name'] ?? $tid ) ), 'app' => $d['app'] ?? ( $TENANTS[ $tid ]['template'] ?? '' ),
+			'billing' => true, 'Balance' => array( 'masking' => (int) ( $d['masking'] ?? 0 ), 'nonmasking' => (int) ( $d['nonmasking'] ?? 0 ) ),
+			'since' => $d['createdAt'] ?? '' );
 	}
+	usort( $list, function ( $a, $b ) { return strcasecmp( $a['name'], $b['name'] ); } );
 	out( array( 'Status' => '0', 'Text' => 'OK', 'accounts' => $list ) );
 }
 
