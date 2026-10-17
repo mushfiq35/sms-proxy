@@ -35,7 +35,7 @@ return array(
 		'billing' => true,
 		'user_admin_roles' => array( 'super' ),
 		'primary_emails'   => array( 'mushfiq35@gmail.com' ),
-		'senders' => array(), // TODO: put Max's masking name and non-masking number here, e.g. array( 'MaxMarket', '88096XXXXXXXX' )
+		'senders' => array( '8809617640271' ), // add the masking name here when masking starts, e.g. array( '8809617640271', 'BRANDNAME' )
 	),
 
 	'kb-enterprise-8a6dd' => array(
@@ -45,7 +45,7 @@ return array(
 		'user_admin_roles' => array( 'admin' ),
 		'primary_emails'   => array( 'mushfiq35@gmail.com' ),
 		'primary_role'     => 'admin',
-		'senders' => array(), // TODO: KB's masking name and non-masking number
+		'senders' => array( '8809617640271' ), // add the masking name here when masking starts, e.g. array( '8809617640271', 'BRANDNAME' )
 	),
 
 	'veterinary-pos-system' => array(
@@ -55,7 +55,7 @@ return array(
 		'user_admin_roles' => array( 'super', 'dm' ),
 		'primary_emails'   => array( 'mushfiq35@gmail.com' ),
 		'member_cache_min' => 60,
-		'senders' => array(), // TODO: Vet's masking name and non-masking number
+		'senders' => array( '8809617640271' ), // add the masking name here when masking starts, e.g. array( '8809617640271', 'BRANDNAME' )
 	),
 
 	'bashar-air-international' => array(
@@ -64,7 +64,7 @@ return array(
 		'billing' => true,
 		'user_admin_roles' => array( 'super' ),
 		'primary_emails'   => array( 'mushfiq35@gmail.com' ),
-		'senders' => array(), // TODO: this app's masking name and non-masking number
+		'senders' => array( '8809617640271' ), // add the masking name here when masking starts, e.g. array( '8809617640271', 'BRANDNAME' )
 	),
 
 );

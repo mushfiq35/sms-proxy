@@ -232,8 +232,11 @@ function sa_json() {
 		return $sa;
 	}
 	$raw = env( 'FIREBASE_SA_JSON' );
-	if ( $raw === '' && is_file( '/etc/secrets/firebase-sa.json' ) ) {
-		$raw = (string) file_get_contents( '/etc/secrets/firebase-sa.json' );
+	// start.sh copies Render's Secret File here (outside the web root, readable by Apache)
+	foreach ( array( '/var/private/firebase-sa.json', '/etc/secrets/firebase-sa.json' ) as $f ) {
+		if ( $raw === '' && is_readable( $f ) ) {
+			$raw = (string) file_get_contents( $f );
+		}
 	}
 	if ( $raw !== '' && $raw[0] !== '{' ) {
 		$raw = (string) base64_decode( $raw );

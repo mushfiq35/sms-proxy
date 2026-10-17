@@ -11,7 +11,9 @@ RUN apt-get update && \
 # .php files) into Apache's web root, so new files show up automatically
 # without editing the Dockerfile again.
 COPY . /var/www/html/
-RUN rm -f /var/www/html/Dockerfile /var/www/html/start.sh /var/www/html/README.md /var/www/html/.gitattributes
+RUN rm -f /var/www/html/Dockerfile /var/www/html/start.sh /var/www/html/README.md /var/www/html/.gitattributes /var/www/html/.dockerignore
+# Never serve secret files (Render copies Secret Files into the build folder too)
+RUN rm -f /var/www/html/*.json
 RUN echo "SMS Proxy is running." > /var/www/html/index.html
 
 # Render assigns a random $PORT at runtime and expects the app to listen on
