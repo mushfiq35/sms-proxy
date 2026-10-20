@@ -455,9 +455,6 @@ if ( ! $tenant && $tenantId !== BILLING_PROJECT ) {
 	}
 	// New client of a known app: use the app template. Balance starts at 0 → nothing can be sent until you recharge.
 	$tenant = array_merge( $TEMPLATES[ $appId ], array( 'billing' => true, 'name' => $shopName !== '' ? $shopName : $tenantId ) );
-	if ( empty( $user['email_verified'] ) ) {
-		unset( $tenant['primary_emails'] );   // a self-made account in an unknown project must not pass as the owner
-	}
 }
 if ( $tenant && ! empty( $tenant['billing'] ) ) {
 	$GLOBALS['ACCT_META'] = array( 'name' => (string) ( $tenant['name'] ?? $shopName ?: $tenantId ), 'app' => $appId !== '' ? $appId : (string) ( $tenant['template'] ?? '' ) );
